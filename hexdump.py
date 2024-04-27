@@ -1,6 +1,37 @@
 # taken from https://gist.github.com/NeatMonster/c06c61ba4114a2b31418a364341c26c0
 
 from rich import print
+from struct import pack, unpack, calcsize
+
+def lr_pack(fields_to_pack):
+    resp = []
+    buf = []
+    for packing_type, field_name, field in fields_to_pack:
+        packed = pack(">" + packing_type, field)
+    
+        resp.append((field_name, packed))
+        buf.append(packed)
+    #print(resp)
+    print(str(hexdump("Sent>", *resp)))
+    return b"".join(buf)
+
+def lr_unpack(packing_types, data):
+    resp = []
+    to_dump = []
+    for packing_type, field_name in packing_types:
+        size = calcsize(packing_type)
+        data_to_unpack = data[0:size]
+        unpacked = unpack(">" + packing_type, data_to_unpack)
+        for u in unpacked:
+            resp.append(u)
+        data = data[size:]
+        to_dump.append((field_name, data_to_unpack, unpacked))
+    print(str(hexdump("Recv>", *to_dump)))
+
+    return resp
+
+
+
 
 class hexdump:
     def __init__(self, header="", *fields):
@@ -14,12 +45,13 @@ class hexdump:
             for i in range(0, len(f[1])):
                 self.color_list.append(c)
             data = f[1]
-            print(f"[color({c})]{f[0]:25} : {data}", end=" ")
+            print(f"[header][color({c})]{f[0]:25} : {data}", end=" ")
             if len(f) > 2:
                 print(f[2])
             else:
                 print()
             self.buf += f[1]
+        print("Buf size:", len(self.buf))
 
     def color(self, pos):
         return self.color_list[pos]

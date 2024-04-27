@@ -13,7 +13,7 @@ from threading import Thread, Semaphore
 from queue import Queue
 from collections import defaultdict
 import math
-from hexdump import hexdump
+from hexdump import hexdump, lr_pack, lr_unpack
 
 from rich import print
 
@@ -29,6 +29,9 @@ CONTROLTYPE_SET_PEER_ID = 0x01
 CONTROLTYPE_PING = 0x02
 CONTROLTYPE_DISCO = 0x03
 
+# NetProtoCompressionMode - https://github.com/minetest/minetest/blob/c63c05b141d994e801c82344499d86f5b67a2e3f/src/network/networkprotocol.h#L1097
+SUPPORTED_NETWORK_COMPRESSION_MODES = 0x00
+
 # Initial sequence number for RELIABLE-type packets.
 SEQNUM_INITIAL = 0xFFDC
 
@@ -36,7 +39,7 @@ SEQNUM_INITIAL = 0xFFDC
 PROTOCOL_ID = 0x4F457403
 
 # No idea.
-SER_FMT_VER_HIGHEST_READ = 0x1A
+SER_FMT_VER_HIGHEST_READ = 0x1D
 
 # Supported protocol versions lifted from official client.
 MIN_SUPPORTED_PROTOCOL = 0x25  # 37  As of 2024-04-19
@@ -77,71 +80,46 @@ class MinetestClientProtocol(object):
         # Buffer for SPLIT-type messages, indexed by sequence number.
         self.split_buffers = defaultdict(dict)
 
-        # Send TOSERVER_INIT and start a reliable connection. The order is
-        # strange, but imitates the official client.
-        self._handshake_start()
-
         self._start_reliable_connection()
 
-        # Lock until the handshake is completed.
-        self.handshake_lock = Semaphore(0)
+        #self._handshake_start()
+
         # Run listen-and-process asynchronously.
         thread = Thread(target=self._receive_and_process)
         thread.daemon = True
         thread.start()
-        self.handshake_lock.acquire()
 
-
-    def lr_pack(self, fields_to_pack):
-        resp = []
-        buf = []
-        for packing_type, field_name, field in fields_to_pack:
-            packed = pack(">" + packing_type, field)
-        
-            resp.append((field_name, packed))
-            buf.append(packed)
-        #print(resp)
-        print(str(hexdump("Sent>", *resp)))
-        return b"".join(buf)
-
-    def lr_unpack(self, packing_types, data):
-        resp = []
-        to_dump = []
-        for packing_type, field_name in packing_types:
-            size = calcsize(packing_type)
-            data_to_unpack = data[0:size]
-            unpacked = unpack(">" + packing_type, data_to_unpack)
-            for u in unpacked:
-                resp.append(u)
-            data = data[size:]
-            to_dump.append((field_name, data_to_unpack, unpacked))
-        print(str(hexdump("Recv>", *to_dump)))
-
-        return resp
-
-
-    def _send(self, packet):
+    def _send(self, packet, channel=None):
         """ Sends a raw packet, containing only the protocol header. """
+        if not channel:
+            channel = self.channel
 
         data = [
             ("I", "header_Protocol_ID", PROTOCOL_ID), 
             ("H", "header_Peer_ID", self.peer_id), 
-            ("B", "header_Channel", self.channel)
+            ("B", "header_Channel", channel)
         ] + packet
 
-        self.sock.sendto(self.lr_pack(data), self.server)
+        self.sock.sendto(lr_pack(data), self.server)
+        #time.sleep(1)
 
     def _handshake_start(self):
         """ Sends the first part of the handshake. """
+        username = self.username.encode("utf-8")
         packet = [
                 ("H", "TOSERVER_INIT", TOSERVER["INIT"]), 
                 ("B", "SER_FMT_VER_HIGHEST_READ", SER_FMT_VER_HIGHEST_READ),
+                ("H", "SUPPORTED_NETWORK_COMPRESSION_MODES", SUPPORTED_NETWORK_COMPRESSION_MODES),
                 ("H", "MIN_SUPPORTED_PROTOCOL", MIN_SUPPORTED_PROTOCOL), 
                 ("H", "MAX_SUPPORTED_PROTOCOL", MAX_SUPPORTED_PROTOCOL),
-                ("20s", "username", self.username.encode('utf-8')), 
+                ("H", "len(username)", len(username)),
+                (str(len(username)) + "s", "username", username),
         ]
         #print(str(hexdump("Sent >> ", packet)))
-        self.send_command(packet)
+        self.send_command(packet, channel=1, reliable=False)
+
+#        self.handshake_lock = Semaphore(0)
+#        self.handshake_lock.acquire()
 
     def _handshake_end(self):
         """ Sends the second and last part of the handshake. """
@@ -150,7 +128,7 @@ class MinetestClientProtocol(object):
         
     def _start_reliable_connection(self):
         """ Starts a reliable connection by sending an empty reliable packet. """
-        self.send_command([])
+        self.send_command([('H', "CONNCMD_SEND", 0)])
 
     def disconnect(self):
         """ Closes the connection. """
@@ -158,7 +136,7 @@ class MinetestClientProtocol(object):
         #self._send(pack('>H', RELIABLE))
         self._send([('H', "RELIABLE", RELIABLE)])
 
-    def _send_reliable(self, message):
+    def _send_reliable(self, message, channel=None):
         """
         Sends a reliable message. This message can be a packet of another
         type, such as CONTROL or ORIGINAL.
@@ -169,13 +147,16 @@ class MinetestClientProtocol(object):
          ("H", "seqnum", self.seqnum & 0xFFFF)
         ] + message
         self.seqnum += 1
-        self._send(packet)
+        self._send(packet, channel)
 
-    def send_command(self, message):
+    def send_command(self, message, reliable=True, channel=None):
         """ Sends a useful message, such as a place or say command. """
         #start = pack('B', ORIGINAL)
         start = [("B", "ORIGINAL", ORIGINAL)]
-        self._send_reliable(start + message)
+        if reliable:
+            self._send_reliable(start + message, channel)
+        else:
+            self._send(start + message, channel)
 
     def _ack(self, seqnum):
         """ Sends an ack for the given sequence number. """
@@ -205,6 +186,8 @@ class MinetestClientProtocol(object):
         """
         packet_type, data = packet[0], packet[1:]
 
+        print(f"Processing: packet_type {packet_type} / data: {data}")
+
         if packet_type == CONTROL:
             if len(data) == 1:
                 assert data[0] == CONTROLTYPE_PING
@@ -212,26 +195,26 @@ class MinetestClientProtocol(object):
                 # response was already sent when we unwrapped it.
                 return
 
-            #control_type, value = self.lr_unpack('>BH', data)
+            #control_type, value = lr_unpack('>BH', data)
 
-            control_type, value = self.lr_unpack([("B", "control_type"), ("H", "value")], data)
+            control_type, value = lr_unpack([("B", "control_type"), ("H", "value")], data)
 
             if control_type == CONTROLTYPE_ACK:
                 self.acked = value
             elif control_type == CONTROLTYPE_SET_PEER_ID:
+                print("Setting peer id to:", value)
                 self.peer_id = value
-                self._handshake_end()
-                self.handshake_lock.release()
+                self._handshake_start()
         elif packet_type == RELIABLE:
-            seqnum, = self.lr_unpack([('H', 'seqnum')], data[:2])
-            self._ack(seqnum)
+            seqnum, = lr_unpack([('H', 'seqnum')], data[:2])
             self._process_packet(data[2:])
+            self._ack(seqnum)
         elif packet_type == ORIGINAL:
             self.receive_buffer.put(data)
         elif packet_type == SPLIT:
             header_size = calcsize('>HHH')
             split_header, split_data = data[:header_size], data[header_size:]
-            seqnumber, chunk_count, chunk_num = self.lr_unpack([('H', 'seqnumber'), ('H', 'chunk_count'), ('H', 'chunk_num')], split_header)
+            seqnumber, chunk_count, chunk_num = lr_unpack([('H', 'seqnumber'), ('H', 'chunk_count'), ('H', 'chunk_num')], split_header)
             self.split_buffers[seqnumber][chunk_num] = split_data
             if chunk_count - 1 in self.split_buffers[seqnumber]:
                 complete = []
@@ -253,12 +236,12 @@ class MinetestClientProtocol(object):
         Constantly listens for incoming packets and processes them as required.
         """
         while True:
+            #time.sleep(1)
             packet, origin = self.sock.recvfrom(1024)
             header_size = calcsize('>IHB')
             header, data = packet[:header_size], packet[header_size:]
             # print("Recv   :" + str(hexdump(header, data)))
-            protocol, peer_id, channel = self.lr_unpack([('I', 'protocol'), ('H', 'peer_id'), ('B', 'channel')], header)
-            print(protocol, PROTOCOL_ID)
+            protocol, peer_id, channel = lr_unpack([('I', 'protocol'), ('H', 'peer_id'), ('B', 'channel')], header)
             assert protocol == PROTOCOL_ID, 'Unexpected protocol.'
             assert peer_id == 0x01, 'Unexpected peer id, should be 1 got {}'.format(peer_id)
             self._process_packet(data)
@@ -286,13 +269,13 @@ class MinetestClient(object):
         # thread to process those messages, and wait until we have a confirmed
         # connection.
         self.access_denied = None
-        self.init_lock = Semaphore(0)
+        #self.init_lock = Semaphore(0)
         thread = Thread(target=self._receive_and_process)
         thread.daemon = True
         thread.start()
         # Wait until we know our position, otherwise the 'move' method will not
         # work.
-        self.init_lock.acquire()
+        #self.init_lock.acquire()
 
         if self.access_denied is not None:
             raise ValueError('Access denied. Reason: ' + self.access_denied)
@@ -373,14 +356,25 @@ class MinetestClient(object):
         """
         while True:
             packet = self.protocol.receive_command()
-            (command_type,), data = self.lr_unpack([('H', command_type)], packet[:2]), packet[2:]
+            (command_type,), data = lr_unpack([('H', "command_type")], packet[:2]), packet[2:]
 
             if command_type == TOCLIENT["INIT"]:
                 # No useful info here.
                 pass
+            elif command_type == TOCLIENT["HELLO"]:
+                print("Volvio un Hello")
+                result = lr_unpack([
+                    ('B', 'deployed serialization version'),
+                    ('H', 'deployed network compression mode'),
+                    ('H', 'deployed protocol version'),
+                    ('I', 'supported auth methods'),
+                    ('s', 'username'),
+                ])
+                print(result)
+                deployed_serial_ver, compression_mode, protocol_version, auth_methods, legacy_username = result
             elif command_type == TOCLIENT["MOVE_PLAYER"]:
-                # x10000, y10000, z10000, pitch1000, yaw1000 = self.lr_unpack('>3i2i', data)
-                x10000, y10000, z10000, pitch1000, yaw1000 = self.lr_unpack([
+                # x10000, y10000, z10000, pitch1000, yaw1000 = lr_unpack('>3i2i', data)
+                x10000, y10000, z10000, pitch1000, yaw1000 = lr_unpack([
                     ('i', 'x10000'),
                     ('i', 'y10000'),
                     ('i', 'z10000'),
@@ -391,7 +385,7 @@ class MinetestClient(object):
                 self.angle = (pitch1000/1000, yaw1000/1000)
                 self.init_lock.release()
             elif command_type == TOCLIENT["CHAT_MESSAGE"]:
-                length, bin_message = self.lr_unpack([('H', 'length')], data[:2]), data[2:]
+                length, bin_message = lr_unpack([('H', 'length')], data[:2]), data[2:]
                 # Length is not matching for some reason.
                 #assert len(bin_message) / 2 == length 
                 message = bin_message.decode('UTF-16BE')
@@ -399,7 +393,7 @@ class MinetestClient(object):
             elif command_type == TOCLIENT["DEATHSCREEN"]:
                 self.respawn()
             elif command_type == TOCLIENT["HP"]:
-                self.hp, = self.lr_unpack([('B', 'hp')], data)
+                self.hp, = lr_unpack([('B', 'hp')], data)
             elif command_type == TOCLIENT["INVENTORY_FORMSPEC"]:
                 pass
             elif command_type == TOCLIENT["INVENTORY"]:
@@ -429,7 +423,7 @@ class MinetestClient(object):
             elif command_type == TOCLIENT["ITEMDEF"]:
                 pass
             elif command_type == TOCLIENT["ACCESS_DENIED"]:
-                length, bin_message = self.lr_unpack([('H', 'length')], data[:2]), data[2:]
+                length, bin_message = lr_unpack([('H', 'length')], data[:2]), data[2:]
                 self.access_denied = bin_message.decode('UTF-16BE')
                 self.init_lock.release()
             else:
